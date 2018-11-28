@@ -3,7 +3,6 @@ import http
 import urllib
 import typing
 
-import sys
 from collections import defaultdict
 
 from mitmproxy import ctx, http
@@ -22,9 +21,7 @@ class ServerPlaybackB:
         self.configured = False
         ctx.options.server_replay_kill_extra = True
 
-        # ctx.options.server_replay_refresh = True
-
-        # self.load_file(ctx.options.server_replay[0])
+        ctx.options.server_replay_refresh = True
 
 
     def load(self, loader):
@@ -114,11 +111,81 @@ class ServerPlaybackB:
     def count(self) -> int:
         return sum([len(i) for i in self.flowmap.values()])
 
+    def _parse(self, r):
+        """
+            Return (path, queries, formdata, content) for a request.
+        """
+        _, _, path, _, query, _ = urllib.parse.urlparse(r.url)
+        queriesArray = urllib.parse.parse_qsl(query, keep_blank_values=True)
+        queries = defaultdict(list)
+        for k, v in queriesArray:
+            queries[k].append(v)
+
+        content = None
+        formdata = None
+        if r.raw_content != b'':
+            if r.multipart_form:
+                formdata = r.multipart_form
+            elif r.urlencoded_form:
+                formdata = r.urlencoded_form
+            else:
+                content = r.content
+        return (path, queries, formdata, content)
+
+    def _match(self, request_a, request_b):
+        """
+            Calculate a match score between two requests.
+            Match algorithm:
+              * identical query keys: 3 points
+              * matching query param present: 1 point
+              * matching query param value: 3 points
+              * identical form keys: 3 points
+              * matching form param present: 1 point
+              * matching form param value: 3 points
+              * matching body (no multipart or encoded form): 4 points
+        """
+        match = 0
+
+        path_a, queries_a, form_a, content_a = self._parse(request_a)
+        path_b, queries_b, form_b, content_b = self._parse(request_b)
+
+        keys_a = set(queries_a.keys())
+        keys_b = set(queries_b.keys())
+        if keys_a == keys_b:
+            match += 3
+
+        for key in keys_a:
+            values_a = set(queries_a[key])
+            values_b = set(queries_b[key])
+            if len(values_a) == len(values_b):
+                match += 1
+            if values_a == values_b:
+                match += 3
+
+        if form_a and form_b:
+            keys_a = set(form_a.keys())
+            keys_b = set(form_b.keys())
+            if keys_a == keys_b:
+                match += 3
+
+            for key in keys_a:
+                values_a = set(form_a.get_all(key))
+                values_b = set(form_b.get_all(key))
+                if len(values_a) == len(values_b):
+                    match += 1
+                if values_a == values_b:
+                    match += 3
+
+        elif content_a and (content_a == content_b):
+            match += 4
+
+        return match
+
     def _hash(self, flow):
         """
             Calculates a loose hash of the flow request.
         """
-        r = flow.request
+        r = flow
 
         _, _, path, _, query, _ = urllib.parse.urlparse(r.url)
         queriesArray = urllib.parse.parse_qsl(query, keep_blank_values=True)
@@ -177,7 +244,7 @@ class ServerPlaybackB:
             candidate = flows[0]
             if (candidate.request.url == request.url and
                candidate.request.raw_content == request.raw_content):
-                # ctx.log.info("For request {} found exact replay match".format(request.url))
+                ctx.log.info("For request {} found exact replay match".format(request.url))
                 return candidate
 
         # find the best match between the request and the available flow candidates
@@ -187,7 +254,7 @@ class ServerPlaybackB:
         for candidate_flow in flows:
             candidate_match = self._match(candidate_flow.request, request)
             ctx.log.info("\n  score={} url={}".format(candidate_match, candidate_flow.request.url))
-            if candidate_match > match:
+            if candidate_match >= match:
                 match = candidate_match
                 flow = candidate_flow
         ctx.log.info("For request \n{} best match \n{} with score=={}".format(request.url,
@@ -198,6 +265,7 @@ class ServerPlaybackB:
         if not self.configured and ctx.options.server_replay:
             self.configured = True
             try:
+                ctx.log.info("Replaying from files: {}".format(ctx.options.server_replay))
                 flows = io.read_flows_from_paths(ctx.options.server_replay)
             except exceptions.FlowReadException as e:
                 raise exceptions.OptionsError(str(e))
@@ -219,93 +287,5 @@ class ServerPlaybackB:
                     )
                 )
                 f.response = http.HTTPResponse.make(404, b'', {'content-type': 'text/plain'})
-
-    def _match(self, request_a, request_b):
-        """
-            Calculate a match score between two requests.
-            Match algorithm:
-              * identical query keys: 3 points
-              * matching query param present: 1 point
-              * matching query param value: 3 points
-              * identical form keys: 3 points
-              * matching form param present: 1 point
-              * matching form param value: 3 points
-              * matching body (no multipart or encoded form): 4 points
-        """
-        match = 0
-
-        path_a, queries_a, form_a, content_a = self._parse(request_a)
-        path_b, queries_b, form_b, content_b = self._parse(request_b)
-
-        keys_a = set(queries_a.keys())
-        keys_b = set(queries_b.keys())
-        if keys_a == keys_b:
-            match += 3
-
-        for key in keys_a:
-            values_a = set(queries_a[key])
-            values_b = set(queries_b[key])
-            if len(values_a) == len(values_b):
-                match += 1
-            if values_a == values_b:
-                match += 3
-
-        if form_a and form_b:
-            keys_a = set(form_a.keys())
-            keys_b = set(form_b.keys())
-            if keys_a == keys_b:
-                match += 3
-
-            for key in keys_a:
-                values_a = set(form_a.get_all(key))
-                values_b = set(form_b.get_all(key))
-                if len(values_a) == len(values_b):
-                    match += 1
-                if values_a == values_b:
-                    match += 3
-
-        elif content_a and (content_a == content_b):
-            match += 4
-
-        return match
-
-    def _parse(self, r):
-        """
-            Return (path, queries, formdata, content) for a request.
-        """
-        _, _, path, _, query, _ = urllib.parse.urlparse(r.url)
-        queriesArray = urllib.parse.parse_qsl(query, keep_blank_values=True)
-        queries = defaultdict(list)
-        for k, v in queriesArray:
-            queries[k].append(v)
-
-        content = None
-        formdata = None
-        if r.raw_content != b'':
-            if r.multipart_form:
-                formdata = r.multipart_form
-            elif r.urlencoded_form:
-                formdata = r.urlencoded_form
-            else:
-                content = r.content
-        return (path, queries, formdata, content)
-
-    def _hash(self, r):
-        """
-            Calculates a loose hash of the flow request.
-        """
-        path, queries, _, _ = self._parse(r)
-
-        key = [str(r.port), str(r.scheme), str(r.method), str(path)]  # type: List[Any]
-        if not ctx.options.server_replay_ignore_host:
-            key.append(r.host)
-
-        if len(queries):
-            key.append("?")
-
-        return hashlib.sha256(
-            repr(key).encode("utf8", "surrogateescape")
-        ).digest()
-
 
 addons = [ServerPlaybackB()]
